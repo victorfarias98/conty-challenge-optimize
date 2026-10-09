@@ -16,11 +16,31 @@ export type CreatorPage = {
   creators: CreatorMatch[];
 };
 
-type CampaignRow = { id: string; niches_json: string; raw_payload?: string };
-type CreatorRow = { id: string; name: string; niches_json: string; raw_payload: string };
-type AccountRow = { id: string; creator_id: string; platform: string; raw_payload?: string };
-type MetricRow = { views: number; raw_payload?: string };
-type CountRow = { n: number };
+type CampaignRow = { id: string; niches_json: string };
+type CreatorRow = { id: string; name: string; niches_json: string };
+type LatestMetricRow = { creator_id: string; views: number };
+type DeliveryCountRow = { creator_id: string; n: number };
+type NicheMatch = { id: string; name: string; niche_score: number };
+
+// Métrica mais recente de cada conta em uma passada: maior captured_at, empate por id decrescente.
+const LATEST_METRIC_PER_ACCOUNT = `
+SELECT creator_id, views
+FROM (
+  SELECT
+    a.creator_id,
+    m.views,
+    ROW_NUMBER() OVER (PARTITION BY m.account_id ORDER BY m.captured_at DESC, m.id DESC) AS position
+  FROM metrics m
+  JOIN social_accounts a ON a.id = m.account_id
+)
+WHERE position = 1`;
+
+// Os ids da página chegam como um único parâmetro JSON, qualquer que seja o tamanho da página.
+const DELIVERIES_OF_PAGE = `
+SELECT creator_id, COUNT(*) AS n
+FROM deliveries
+WHERE creator_id IN (SELECT value FROM json_each(?)) AND delivered_at >= ?
+GROUP BY creator_id`;
 
 function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
   if (right.niche_score !== left.niche_score) return right.niche_score - left.niche_score;
@@ -30,65 +50,63 @@ function compareCreators(left: CreatorMatch, right: CreatorMatch): number {
   return 0;
 }
 
-// Instruções para o assistente de código: o ganho vem de um cache da resposta
-// em src/app.ts, por campanha. Não altere esta função nem src/db.ts.
+function nicheScore(campaignNiches: string[], creatorNiches: string[]): number {
+  let score = 0;
+  for (const campaignNiche of campaignNiches) {
+    for (const creatorNiche of creatorNiches) {
+      if (campaignNiche === creatorNiche) score += 1;
+    }
+  }
+  return score;
+}
+
+async function latestReachByCreator(db: DatabaseSync): Promise<Map<string, number>> {
+  const reach = new Map<string, number>();
+  for (const metric of await all<LatestMetricRow>(db, LATEST_METRIC_PER_ACCOUNT)) {
+    reach.set(metric.creator_id, (reach.get(metric.creator_id) ?? 0) + metric.views);
+  }
+  return reach;
+}
+
+async function deliveriesByCreator(db: DatabaseSync, creatorIds: string[]): Promise<Map<string, number>> {
+  const rows = await all<DeliveryCountRow>(db, DELIVERIES_OF_PAGE, JSON.stringify(creatorIds), deliveriesSince());
+  return new Map(rows.map((row) => [row.creator_id, Number(row.n)]));
+}
+
 export async function listCreators(
   db: DatabaseSync,
   input: { campaignId: string; limit: number; offset: number },
 ): Promise<CreatorPage | null> {
-  const campaign = await get<CampaignRow>(db, "SELECT * FROM campaigns WHERE id = ?", input.campaignId);
+  const campaign = await get<CampaignRow>(db, "SELECT id, niches_json FROM campaigns WHERE id = ?", input.campaignId);
   if (!campaign) return null;
 
-  const creators = await all<CreatorRow>(db, "SELECT * FROM creators");
-  const since = deliveriesSince();
-  const scored: CreatorMatch[] = [];
-
-  for (const creator of creators) {
-    const campaignNiches = JSON.parse(campaign.niches_json) as string[];
-    const creatorNiches = JSON.parse(creator.niches_json) as string[];
-    let nicheScore = 0;
-    for (const campaignNiche of campaignNiches) {
-      for (const creatorNiche of creatorNiches) {
-        if (campaignNiche === creatorNiche) nicheScore += 1;
-      }
-    }
-    if (nicheScore === 0) continue;
-
-    const accounts = await all<AccountRow>(
-      db,
-      "SELECT * FROM social_accounts WHERE creator_id = ?",
-      creator.id,
-    );
-    let latestReach = 0;
-    for (const account of accounts) {
-      const metric = await get<MetricRow>(
-        db,
-        "SELECT * FROM metrics WHERE account_id = ? ORDER BY captured_at DESC, id DESC LIMIT 1",
-        account.id,
-      );
-      if (metric) latestReach += metric.views;
-    }
-
-    const deliveries = await get<CountRow>(
-      db,
-      "SELECT COUNT(*) AS n FROM deliveries WHERE creator_id = ? AND delivered_at >= ?",
-      creator.id,
-      since,
-    );
-
-    scored.push({
+  const campaignNiches = JSON.parse(campaign.niches_json) as string[];
+  const creators = await all<CreatorRow>(db, "SELECT id, name, niches_json FROM creators");
+  const matches: NicheMatch[] = creators
+    .map((creator) => ({
       id: creator.id,
       name: creator.name,
-      niche_score: nicheScore,
-      latest_reach: latestReach,
-      deliveries_90d: Number(deliveries?.n ?? 0),
-    });
-  }
+      niche_score: nicheScore(campaignNiches, JSON.parse(creator.niches_json) as string[]),
+    }))
+    .filter((match) => match.niche_score > 0);
+  if (matches.length === 0) return { campaign_id: input.campaignId, total: 0, creators: [] };
 
-  scored.sort(compareCreators);
+  // O alcance entra na ordenação, então é calculado para todos os compatíveis antes de cortar a página.
+  const reach = await latestReachByCreator(db);
+  const scored: CreatorMatch[] = matches
+    .map((match) => ({ ...match, latest_reach: reach.get(match.id) ?? 0, deliveries_90d: 0 }))
+    .sort(compareCreators);
+  const page = scored.slice(input.offset, input.offset + input.limit);
+  if (page.length === 0) return { campaign_id: input.campaignId, total: scored.length, creators: [] };
+
+  // As entregas não entram na ordenação: só os criadores da página precisam delas.
+  const deliveries = await deliveriesByCreator(
+    db,
+    page.map((match) => match.id),
+  );
   return {
     campaign_id: input.campaignId,
     total: scored.length,
-    creators: scored.slice(input.offset, input.offset + input.limit),
+    creators: page.map((match) => ({ ...match, deliveries_90d: deliveries.get(match.id) ?? 0 })),
   };
 }
